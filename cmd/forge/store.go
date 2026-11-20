@@ -115,6 +115,8 @@ type RepoRecord struct {
 	ReceiveRefsCache atomic.Pointer[CachedHTTPFrame]
 	LsRefsCache      sync.Map
 	ShallowCache     sync.Map
+	HasLsRefsCache   bool
+	HasShallowCache  bool
 
 	Labels           map[string]LabelRecord
 	NextNumber       int
@@ -326,7 +328,7 @@ func (r *RepoRecord) SaveGitObjectLocked(obj *GitObject) *GitObject {
 	}
 	r.Objects[obj.OID] = obj
 	if obj.Type == "commit" {
-		r.CommitParents[obj.OID] = ParseCommit(obj.Data).Parents
+		r.CommitParents[obj.OID] = ExtractCommitParents(obj.Data)
 	}
 	return obj
 }
@@ -334,14 +336,20 @@ func (r *RepoRecord) SaveGitObjectLocked(obj *GitObject) *GitObject {
 func (r *RepoRecord) BumpRefVersionLocked() {
 	r.RefVersion++
 	r.ReceiveRefsCache.Store(nil)
-	r.LsRefsCache.Range(func(k, _ any) bool {
-		r.LsRefsCache.Delete(k)
-		return true
-	})
-	r.ShallowCache.Range(func(k, _ any) bool {
-		r.ShallowCache.Delete(k)
-		return true
-	})
+	if r.HasLsRefsCache {
+		r.HasLsRefsCache = false
+		r.LsRefsCache.Range(func(k, _ any) bool {
+			r.LsRefsCache.Delete(k)
+			return true
+		})
+	}
+	if r.HasShallowCache {
+		r.HasShallowCache = false
+		r.ShallowCache.Range(func(k, _ any) bool {
+			r.ShallowCache.Delete(k)
+			return true
+		})
+	}
 }
 
 func (s *ForgeStore) GetRepo(owner, name string) *RepoRecord {

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"sort"
 	"strconv"
@@ -93,8 +94,15 @@ func IsValidOID(s string) bool {
 	return true
 }
 
+var sha1Pool = sync.Pool{
+	New: func() any {
+		return sha1.New()
+	},
+}
+
 func HashGitObject(objType string, data []byte) string {
-	h := sha1.New()
+	h := sha1Pool.Get().(hash.Hash)
+	h.Reset()
 	var hdrBuf [40]byte
 	hdr := hdrBuf[:0]
 	hdr = append(hdr, objType...)
@@ -105,7 +113,31 @@ func HashGitObject(objType string, data []byte) string {
 	h.Write(data)
 	var sum [20]byte
 	h.Sum(sum[:0])
+	sha1Pool.Put(h)
 	return hex.EncodeToString(sum[:])
+}
+
+func ExtractCommitParents(data []byte) []string {
+	var parents []string
+	off := 0
+	for off < len(data) {
+		nl := bytes.IndexByte(data[off:], '\n')
+		var line []byte
+		if nl < 0 {
+			line = data[off:]
+			off = len(data)
+		} else {
+			line = data[off : off+nl]
+			off += nl + 1
+		}
+		if len(line) == 0 {
+			break
+		}
+		if len(line) == 47 && bytes.HasPrefix(line, []byte("parent ")) {
+			parents = append(parents, string(line[7:]))
+		}
+	}
+	return parents
 }
 
 func CreateGitObject(objType string, data []byte, deflated []byte) *GitObject {

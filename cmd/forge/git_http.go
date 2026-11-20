@@ -468,6 +468,9 @@ func handleUploadPackV2(repo *RepoRecord, packets []PktPacket, rawBody string) (
 
 		body = append(body, FlushPkt...)
 		frame := buildRawHTTPFrame(200, "OK", "application/x-git-upload-pack-result", body, "Cache-Control: no-cache\r\n")
+		repo.mu.Lock()
+		repo.HasLsRefsCache = true
+		repo.mu.Unlock()
 		repo.LsRefsCache.Store(rawBody, &CachedHTTPFrame{Version: ver, Body: frame})
 		return frame, nil
 	}
@@ -508,6 +511,9 @@ func handleUploadPackV2(repo *RepoRecord, packets []PktPacket, rawBody string) (
 
 		frame := buildRawHTTPFrame(200, "OK", "application/x-git-upload-pack-result", respBody, "Cache-Control: no-cache\r\n")
 		if isDepth1Fast {
+			repo.mu.Lock()
+			repo.HasShallowCache = true
+			repo.mu.Unlock()
 			repo.ShallowCache.Store(wants[0], &CachedHTTPFrame{Version: ver, Body: frame})
 		}
 		return frame, nil

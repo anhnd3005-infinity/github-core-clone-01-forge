@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -67,30 +68,59 @@ func envHTTPExchange(method, dialAddr, hostHeader, reqPath string, jsonBody []by
 		return 0, nil, err
 	}
 
-	rawResp, err := io.ReadAll(conn)
-	if err != nil && len(rawResp) == 0 {
+	br := bufio.NewReaderSize(conn, 8192)
+	statusLineBytes, err := br.ReadSlice('\n')
+	if err != nil {
 		return 0, nil, err
 	}
-	nl := bytes.IndexByte(rawResp, '\n')
-	if nl < 0 {
-		return 0, nil, fmt.Errorf("malformed env HTTP response")
-	}
-	statusLine := string(bytes.TrimSpace(rawResp[:nl]))
-	parts := strings.SplitN(statusLine, " ", 3)
+	parts := strings.SplitN(string(bytes.TrimSpace(statusLineBytes)), " ", 3)
 	if len(parts) < 2 {
-		return 0, nil, fmt.Errorf("invalid status line %q", statusLine)
+		return 0, nil, fmt.Errorf("invalid status line")
 	}
 	status, _ := strconv.Atoi(parts[1])
-	sep := bytes.Index(rawResp, []byte("\r\n\r\n"))
-	bodyOffset := sep + 4
-	if sep < 0 {
-		sep = bytes.Index(rawResp, []byte("\n\n"))
-		bodyOffset = sep + 2
+
+	contentLen := -1
+	isChunked := false
+	for {
+		hline, hErr := br.ReadSlice('\n')
+		if hErr != nil {
+			return status, nil, hErr
+		}
+		hline = trimASCIISpace(hline)
+		if len(hline) == 0 {
+			break
+		}
+		colon := bytes.IndexByte(hline, ':')
+		if colon <= 0 {
+			continue
+		}
+		key := hline[:colon]
+		val := trimASCIISpace(hline[colon+1:])
+		if asciiEqualFold(key, "content-length") {
+			if cl, ok := parseASCIIInt(val); ok {
+				contentLen = cl
+			}
+		} else if asciiEqualFold(key, "transfer-encoding") {
+			if strings.Contains(strings.ToLower(string(val)), "chunked") {
+				isChunked = true
+			}
+		}
 	}
-	if sep < 0 || bodyOffset > len(rawResp) {
+
+	if isChunked {
+		body, cErr := readChunkedBody(br, make([]byte, 0, 256))
+		return status, body, cErr
+	}
+	if contentLen > 0 {
+		body := make([]byte, contentLen)
+		_, rErr := io.ReadFull(br, body)
+		return status, body, rErr
+	}
+	if contentLen == 0 {
 		return status, nil, nil
 	}
-	return status, rawResp[bodyOffset:], nil
+	body, rErr := io.ReadAll(br)
+	return status, body, rErr
 }
 
 func registerPort(dialAddr, hostHeader, basePath string, port int) {

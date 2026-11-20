@@ -1,0 +1,14 @@
+{
+  "name": "github-core-clone-01-forge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-dependency pure Node 22 in-memory GitHub-compatible git forge (Smart-HTTP v2, REST v3, GraphQL v4, MCP).",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}

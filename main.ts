@@ -14,13 +14,22 @@ let binPath = join(baseDir, isLinuxX64 ? 'forge-linux-amd64' : 'forge-darwin');
 
 if (!existsSync(binPath)) {
   if (!isLinuxX64) {
+    const goBin =
+      ['/opt/homebrew/bin/go', '/usr/local/go/bin/go', '/usr/local/bin/go'].find((p) =>
+        existsSync(p),
+      ) ?? 'go';
     const tmpBin = `/tmp/forge-darwin-${process.pid}`;
-    execFileSync('go', ['build', '-o', tmpBin, './cmd/forge'], {
+    execFileSync(goBin, ['build', '-o', tmpBin, './cmd/forge'], {
       cwd: baseDir,
       stdio: ['ignore', 'ignore', 'pipe'],
       env: {
         ...process.env,
+        HOME: process.env.HOME || '/tmp',
+        PATH: `${process.env.PATH ? `${process.env.PATH}:` : ''}/opt/homebrew/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin`,
+        CGO_ENABLED: '0',
         GOCACHE: process.env.GOCACHE || '/tmp/go-build-cache',
+        GOPATH: process.env.GOPATH || '/tmp/go-path',
+        GOTMPDIR: process.env.GOTMPDIR || '/tmp',
       },
     });
     binPath = tmpBin;

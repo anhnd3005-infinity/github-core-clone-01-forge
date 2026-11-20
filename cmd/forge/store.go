@@ -7,8 +7,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -46,6 +44,13 @@ type IssueRecord struct {
 	jsonBytes    []byte
 	http200Frame []byte
 	http201Frame []byte
+}
+
+func (iss *IssueRecord) HTTP200Frame() []byte {
+	if iss.http200Frame == nil {
+		iss.http200Frame = buildHTTPFrameBytes(200, "OK", iss.jsonBytes, "")
+	}
+	return iss.http200Frame
 }
 
 type RefEnd struct {
@@ -95,8 +100,6 @@ type CachedHTTPFrame struct {
 }
 
 type RepoRecord struct {
-	mu sync.RWMutex
-
 	ID            int
 	GlobalID      string
 	Owner         string
@@ -107,24 +110,35 @@ type RepoRecord struct {
 	DefaultBranch string
 	CreatedAt     string
 
-	Objects       map[string]*GitObject
-	CommitParents map[string][]string
-	Refs          map[string]string
-	RefVersion    uint64
+	Objects    map[string]*GitObject
+	Refs       map[string]string
+	RefVersion uint64
 
-	ReceiveRefsCache atomic.Pointer[CachedHTTPFrame]
-	LsRefsCache      sync.Map
-	ShallowCache     sync.Map
-	HasLsRefsCache   bool
-	HasShallowCache  bool
+	receiveMainFrame  []byte
+	receiveMainOIDOff int
+	receiveRefsFrame  []byte
+	receiveRefsVer    uint64
+	lastLsRefsBody    []byte
+	lastLsRefsFrame   []byte
+	lsRefsMap         map[string][]byte
+	lastFetchBody     []byte
+	lastFetchFrame    []byte
+	shallowMap        map[string][]byte
 
 	Labels           map[string]LabelRecord
 	NextNumber       int
 	Issues           []*IssueRecord
-	IssuesByNumber   map[int]*IssueRecord
+	IssuesByNum      []*IssueRecord
 	Pulls            []*PullRecord
 	PullsByNumber    map[int]*PullRecord
 	CommentsByNumber map[int][]*CommentRecord
+}
+
+func (r *RepoRecord) GetIssue(num int) *IssueRecord {
+	if num <= 0 || num >= len(r.IssuesByNum) {
+		return nil
+	}
+	return r.IssuesByNum[num]
 }
 
 func (r *RepoRecord) JSONView() RepoJSON {
@@ -151,13 +165,21 @@ func (e *StoreError) Error() string {
 }
 
 func EncodeGlobalID(kind string, a int, b ...int) string {
-	var raw string
-	if len(b) == 0 {
-		raw = kind + ":" + strconv.Itoa(a)
-	} else {
-		raw = kind + ":" + strconv.Itoa(a) + ":" + strconv.Itoa(b[0])
+	var rawBuf [48]byte
+	raw := append(rawBuf[:0], kind...)
+	raw = append(raw, ':')
+	raw = strconv.AppendInt(raw, int64(a), 10)
+	if len(b) > 0 {
+		raw = append(raw, ':')
+		raw = strconv.AppendInt(raw, int64(b[0]), 10)
 	}
-	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+	var encBuf [64]byte
+	n := base64.RawURLEncoding.EncodedLen(len(raw))
+	if n <= len(encBuf) {
+		base64.RawURLEncoding.Encode(encBuf[:n], raw)
+		return string(encBuf[:n])
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
 func DecodeGlobalID(globalID string) (string, int, int, bool) {
@@ -184,22 +206,25 @@ func DecodeGlobalID(globalID string) (string, int, int, bool) {
 }
 
 func buildHTTPFrameBytes(statusCode int, statusText string, body []byte, extraHeaders string) []byte {
-	var b strings.Builder
-	b.Grow(160 + len(extraHeaders) + len(body))
-	b.WriteString("HTTP/1.1 ")
-	b.WriteString(strconv.Itoa(statusCode))
-	b.WriteByte(' ')
-	b.WriteString(statusText)
-	b.WriteString("\r\nContent-Type: application/json; charset=utf-8\r\nX-GitHub-Request-Id: fg-ok\r\n")
+	var lenBuf [20]byte
+	lenBytes := strconv.AppendInt(lenBuf[:0], int64(len(body)), 10)
+	var codeBuf [8]byte
+	codeBytes := strconv.AppendInt(codeBuf[:0], int64(statusCode), 10)
+
+	hdrCap := 9 + len(codeBytes) + 1 + len(statusText) + 61 + len(extraHeaders) + 16 + len(lenBytes) + 4
+	out := make([]byte, 0, hdrCap+len(body))
+	out = append(out, "HTTP/1.1 "...)
+	out = append(out, codeBytes...)
+	out = append(out, ' ')
+	out = append(out, statusText...)
+	out = append(out, "\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\n"...)
 	if extraHeaders != "" {
-		b.WriteString(extraHeaders)
+		out = append(out, extraHeaders...)
 	}
-	b.WriteString("Content-Length: ")
-	b.WriteString(strconv.Itoa(len(body)))
-	b.WriteString("\r\n\r\n")
-	out := make([]byte, b.Len()+len(body))
-	copy(out, b.String())
-	copy(out[b.Len():], body)
+	out = append(out, "Content-Length: "...)
+	out = append(out, lenBytes...)
+	out = append(out, "\r\n\r\n"...)
+	out = append(out, body...)
 	return out
 }
 
@@ -236,10 +261,9 @@ func appendEscapedJSONString(dst []byte, s string) []byte {
 	return append(dst, '"')
 }
 
-func rebuildIssueFrames(issue *IssueRecord) {
-	var jb []byte
+func buildIssueJSON(issue *IssueRecord) []byte {
 	if len(issue.Labels) == 0 {
-		jb = make([]byte, 0, 160+len(issue.Title)+len(issue.Body))
+		jb := make([]byte, 0, 160+len(issue.Title)+len(issue.Body))
 		jb = append(jb, `{"id":`...)
 		jb = strconv.AppendInt(jb, int64(issue.ID), 10)
 		jb = append(jb, `,"node_id":`...)
@@ -255,25 +279,26 @@ func rebuildIssueFrames(issue *IssueRecord) {
 		jb = append(jb, `,"labels":[],"created_at":`...)
 		jb = appendEscapedJSONString(jb, issue.CreatedAt)
 		jb = append(jb, '}')
-	} else {
-		jb, _ = json.Marshal(issue)
+		return jb
 	}
-	issue.jsonBytes = jb
-	issue.http200Frame = buildHTTPFrameBytes(200, "OK", jb, "")
-	issue.http201Frame = buildHTTPFrameBytes(201, "Created", jb, "")
+	jb, _ := json.Marshal(issue)
+	return jb
 }
 
 type ForgeStore struct {
-	mu            sync.RWMutex
 	Viewer        ViewerInfo
 	baseEpochSec  int64
-	clockSeq      atomic.Int64
-	nextRepoID    atomic.Int64
-	nextIssueID   atomic.Int64
-	nextPullID    atomic.Int64
-	nextCommentID atomic.Int64
+	clockSeq      int64
+	curMinBucket  int64
+	isoBuf        [24]byte
+	nextRepoID    int64
+	nextIssueID   int64
+	nextPullID    int64
+	nextCommentID int64
 	reposByName   map[string]*RepoRecord
 	reposByID     map[int]*RepoRecord
+	lastRepoName  string
+	lastRepo      *RepoRecord
 }
 
 func parseTrialEpochSec(rawNow string) int64 {
@@ -301,22 +326,33 @@ func NewForgeStore(viewerLogin, trialNow string) *ForgeStore {
 			Name:  name,
 			Email: login + "@example.invalid",
 		},
-		baseEpochSec: parseTrialEpochSec(trialNow),
-		reposByName:  make(map[string]*RepoRecord, 64),
-		reposByID:    make(map[int]*RepoRecord, 64),
+		baseEpochSec:  parseTrialEpochSec(trialNow),
+		curMinBucket:  -1,
+		nextRepoID:    50000,
+		nextIssueID:   100000,
+		nextPullID:    200000,
+		nextCommentID: 300000,
+		reposByName:   make(map[string]*RepoRecord, 64),
+		reposByID:     make(map[int]*RepoRecord, 64),
 	}
-	st.nextRepoID.Store(50000)
-	st.nextIssueID.Store(100000)
-	st.nextPullID.Store(200000)
-	st.nextCommentID.Store(300000)
 	return st
 }
 
 func (s *ForgeStore) nextClock() (int64, string, int) {
-	seq := s.clockSeq.Add(1)
+	s.clockSeq++
+	seq := s.clockSeq
 	epoch := s.baseEpochSec + seq
-	iso := time.Unix(epoch, 0).UTC().Format("2006-01-02T15:04:05.000Z")
-	return epoch, iso, int(seq)
+	minBucket := epoch / 60
+	if minBucket != s.curMinBucket {
+		s.curMinBucket = minBucket
+		formatted := time.Unix(epoch, 0).UTC().Format("2006-01-02T15:04:05.000Z")
+		copy(s.isoBuf[:], formatted)
+	} else {
+		sec := epoch % 60
+		s.isoBuf[17] = byte('0' + sec/10)
+		s.isoBuf[18] = byte('0' + sec%10)
+	}
+	return epoch, string(s.isoBuf[:]), int(seq)
 }
 
 func (r *RepoRecord) SaveGitObjectLocked(obj *GitObject) *GitObject {
@@ -327,28 +363,22 @@ func (r *RepoRecord) SaveGitObjectLocked(obj *GitObject) *GitObject {
 		return existing
 	}
 	r.Objects[obj.OID] = obj
-	if obj.Type == "commit" {
-		r.CommitParents[obj.OID] = ExtractCommitParents(obj.Data)
-	}
 	return obj
 }
 
 func (r *RepoRecord) BumpRefVersionLocked() {
 	r.RefVersion++
-	r.ReceiveRefsCache.Store(nil)
-	if r.HasLsRefsCache {
-		r.HasLsRefsCache = false
-		r.LsRefsCache.Range(func(k, _ any) bool {
-			r.LsRefsCache.Delete(k)
-			return true
-		})
+	r.receiveRefsFrame = nil
+	r.receiveRefsVer = 0
+	r.lastLsRefsBody = nil
+	r.lastLsRefsFrame = nil
+	if len(r.lsRefsMap) > 0 {
+		clear(r.lsRefsMap)
 	}
-	if r.HasShallowCache {
-		r.HasShallowCache = false
-		r.ShallowCache.Range(func(k, _ any) bool {
-			r.ShallowCache.Delete(k)
-			return true
-		})
+	r.lastFetchBody = nil
+	r.lastFetchFrame = nil
+	if len(r.shallowMap) > 0 {
+		clear(r.shallowMap)
 	}
 }
 
@@ -356,9 +386,14 @@ func (s *ForgeStore) GetRepo(owner, name string) *RepoRecord {
 	if owner != s.Viewer.Login {
 		return nil
 	}
-	s.mu.RLock()
+	if name == s.lastRepoName && s.lastRepo != nil {
+		return s.lastRepo
+	}
 	repo := s.reposByName[name]
-	s.mu.RUnlock()
+	if repo != nil {
+		s.lastRepoName = repo.Name
+		s.lastRepo = repo
+	}
 	return repo
 }
 
@@ -375,10 +410,7 @@ func (s *ForgeStore) GetRepoByGlobalID(gid string) *RepoRecord {
 	if !ok || kind != "Repo" {
 		return nil
 	}
-	s.mu.RLock()
-	repo := s.reposByID[id]
-	s.mu.RUnlock()
-	return repo
+	return s.reposByID[id]
 }
 
 func (s *ForgeStore) GetIssueByGlobalID(gid string) (*RepoRecord, *IssueRecord) {
@@ -386,15 +418,11 @@ func (s *ForgeStore) GetIssueByGlobalID(gid string) (*RepoRecord, *IssueRecord) 
 	if !ok || kind != "Issue" {
 		return nil, nil
 	}
-	s.mu.RLock()
 	repo := s.reposByID[repoID]
-	s.mu.RUnlock()
 	if repo == nil {
 		return nil, nil
 	}
-	repo.mu.RLock()
-	iss := repo.IssuesByNumber[num]
-	repo.mu.RUnlock()
+	iss := repo.GetIssue(num)
 	if iss == nil {
 		return nil, nil
 	}
@@ -406,15 +434,11 @@ func (s *ForgeStore) GetPullByGlobalID(gid string) (*RepoRecord, *PullRecord) {
 	if !ok || kind != "Pull" {
 		return nil, nil
 	}
-	s.mu.RLock()
 	repo := s.reposByID[repoID]
-	s.mu.RUnlock()
 	if repo == nil {
 		return nil, nil
 	}
-	repo.mu.RLock()
 	pr := repo.PullsByNumber[num]
-	repo.mu.RUnlock()
 	if pr == nil {
 		return nil, nil
 	}
@@ -422,18 +446,17 @@ func (s *ForgeStore) GetPullByGlobalID(gid string) (*RepoRecord, *PullRecord) {
 }
 
 func (s *ForgeStore) CreateRepo(name, desc string, private bool) (*RepoRecord, error) {
-	clean := strings.TrimSpace(name)
+	clean := strings.Clone(strings.TrimSpace(name))
 	if clean == "" {
 		return nil, &StoreError{Status: 422, Message: "Repository name is required"}
 	}
-	id := int(s.nextRepoID.Add(1))
-	gid := EncodeGlobalID("Repo", id)
-	_, createdAt, _ := s.nextClock()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.reposByName[clean] != nil {
 		return nil, &StoreError{Status: 422, Message: "Repository creation failed: name already exists on this account"}
 	}
+	s.nextRepoID++
+	id := int(s.nextRepoID)
+	gid := EncodeGlobalID("Repo", id)
+	_, createdAt, _ := s.nextClock()
 	repo := &RepoRecord{
 		ID:               id,
 		GlobalID:         gid,
@@ -441,41 +464,38 @@ func (s *ForgeStore) CreateRepo(name, desc string, private bool) (*RepoRecord, e
 		Name:             clean,
 		FullName:         s.Viewer.Login + "/" + clean,
 		Private:          private,
-		Description:      desc,
+		Description:      strings.Clone(desc),
 		DefaultBranch:    "main",
 		CreatedAt:        createdAt,
 		Objects:          make(map[string]*GitObject),
-		CommitParents:    make(map[string][]string),
 		Refs:             make(map[string]string),
 		RefVersion:       1,
 		Labels:           make(map[string]LabelRecord),
 		NextNumber:       1,
-		Issues:           make([]*IssueRecord, 0),
-		IssuesByNumber:   make(map[int]*IssueRecord),
+		Issues:           make([]*IssueRecord, 0, 8),
+		IssuesByNum:      make([]*IssueRecord, 1, 16),
 		Pulls:            make([]*PullRecord, 0),
 		PullsByNumber:    make(map[int]*PullRecord),
 		CommentsByNumber: make(map[int][]*CommentRecord),
 	}
 	s.reposByName[clean] = repo
 	s.reposByID[id] = repo
+	s.lastRepoName = clean
+	s.lastRepo = repo
 	return repo, nil
 }
 
 func (s *ForgeStore) ListViewerRepos() []RepoJSON {
-	s.mu.RLock()
 	repos := make([]*RepoRecord, 0, len(s.reposByName))
 	for _, r := range s.reposByName {
 		repos = append(repos, r)
 	}
-	s.mu.RUnlock()
 	sort.Slice(repos, func(i, j int) bool {
 		return repos[i].ID < repos[j].ID
 	})
 	out := make([]RepoJSON, len(repos))
 	for i, r := range repos {
-		r.mu.RLock()
 		out[i] = r.JSONView()
-		r.mu.RUnlock()
 	}
 	return out
 }
@@ -485,16 +505,14 @@ func (s *ForgeStore) PatchRepo(owner, name string, desc *string, private *bool, 
 	if err != nil {
 		return RepoJSON{}, err
 	}
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
 	if desc != nil {
-		repo.Description = *desc
+		repo.Description = strings.Clone(*desc)
 	}
 	if private != nil {
 		repo.Private = *private
 	}
 	if defBranch != nil && strings.TrimSpace(*defBranch) != "" {
-		repo.DefaultBranch = strings.TrimSpace(*defBranch)
+		repo.DefaultBranch = strings.Clone(strings.TrimSpace(*defBranch))
 	}
 	return repo.JSONView(), nil
 }
@@ -503,14 +521,16 @@ func (s *ForgeStore) DeleteRepo(owner, name string) error {
 	if owner != s.Viewer.Login {
 		return &StoreError{Status: 404, Message: "Not Found"}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	repo := s.reposByName[name]
 	if repo == nil {
 		return &StoreError{Status: 404, Message: "Not Found"}
 	}
 	delete(s.reposByName, name)
 	delete(s.reposByID, repo.ID)
+	if s.lastRepo == repo {
+		s.lastRepoName = ""
+		s.lastRepo = nil
+	}
 	return nil
 }
 
@@ -545,11 +565,11 @@ func (s *ForgeStore) PutContent(owner, name, rawPath, message, b64Content, branc
 	if err != nil {
 		return 0, nil, err
 	}
-	cleanPath := strings.Trim(rawPath, "/")
+	cleanPath := strings.Clone(strings.Trim(rawPath, "/"))
 	if cleanPath == "" {
 		return 0, nil, &StoreError{Status: 422, Message: "Invalid file path"}
 	}
-	msg := message
+	msg := strings.Clone(message)
 	if msg == "" {
 		msg = "Update " + cleanPath
 	}
@@ -568,10 +588,7 @@ func (s *ForgeStore) PutContent(owner, name, rawPath, message, b64Content, branc
 	epoch, _, _ := s.nextClock()
 	who := s.authorLine(epoch)
 
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
-
-	targetBranch := strings.TrimSpace(branch)
+	targetBranch := strings.Clone(strings.TrimSpace(branch))
 	if targetBranch == "" {
 		targetBranch = repo.DefaultBranch
 	}
@@ -642,9 +659,6 @@ func (s *ForgeStore) GetContent(owner, name, rawPath, ref string) (any, error) {
 		return nil, err
 	}
 	cleanPath := strings.Trim(rawPath, "/")
-
-	repo.mu.RLock()
-	defer repo.mu.RUnlock()
 
 	commitOID := repo.resolveCommitLocked(ref)
 	if commitOID == "" {
@@ -739,15 +753,12 @@ func (s *ForgeStore) DeleteContent(owner, name, rawPath, message, wantSHA, branc
 		return nil, err
 	}
 	cleanPath := strings.Trim(rawPath, "/")
-	msg := message
+	msg := strings.Clone(message)
 	if msg == "" {
 		msg = "Delete " + cleanPath
 	}
 	epoch, _, _ := s.nextClock()
 	who := s.authorLine(epoch)
-
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
 
 	targetBranch := strings.TrimSpace(branch)
 	if targetBranch == "" {
@@ -788,14 +799,12 @@ func (s *ForgeStore) CreateRef(owner, name, ref, sha string) (map[string]any, er
 	if ref == "" || sha == "" {
 		return nil, &StoreError{Status: 422, Message: "ref and sha are required"}
 	}
-	refName := ref
+	refName := strings.Clone(ref)
 	if !strings.HasPrefix(refName, "refs/") {
 		refName = "refs/heads/" + refName
 	}
-	lowerSHA := strings.ToLower(sha)
+	lowerSHA := strings.Clone(strings.ToLower(sha))
 
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
 	if !IsValidOID(lowerSHA) || repo.Objects[lowerSHA] == nil {
 		return nil, &StoreError{Status: 422, Message: "Object does not exist"}
 	}
@@ -822,9 +831,7 @@ func (s *ForgeStore) GetRef(owner, name, refPath string) (map[string]any, error)
 	if !strings.HasPrefix(fullRef, "refs/") {
 		fullRef = "refs/" + fullRef
 	}
-	repo.mu.RLock()
 	oid := repo.Refs[fullRef]
-	repo.mu.RUnlock()
 	if oid == "" {
 		return nil, &StoreError{Status: 404, Message: "Not Found"}
 	}
@@ -842,7 +849,6 @@ func (s *ForgeStore) ListBranches(owner, name string) ([]map[string]any, error) 
 	if err != nil {
 		return nil, err
 	}
-	repo.mu.RLock()
 	def := repo.DefaultBranch
 	type br struct {
 		name string
@@ -854,7 +860,6 @@ func (s *ForgeStore) ListBranches(owner, name string) ([]map[string]any, error) 
 			list = append(list, br{name: ref[len("refs/heads/"):], sha: oid})
 		}
 	}
-	repo.mu.RUnlock()
 	sort.Slice(list, func(i, j int) bool {
 		if list[i].name == def {
 			return true
@@ -879,9 +884,7 @@ func (s *ForgeStore) GetBranch(owner, name, branch string) (map[string]any, erro
 	if err != nil {
 		return nil, err
 	}
-	repo.mu.RLock()
 	oid := repo.Refs["refs/heads/"+branch]
-	repo.mu.RUnlock()
 	if oid == "" {
 		return nil, &StoreError{Status: 404, Message: "Branch not found"}
 	}
@@ -896,8 +899,6 @@ func (s *ForgeStore) ListCommits(owner, name, shaParam string) ([]map[string]any
 	if err != nil {
 		return nil, err
 	}
-	repo.mu.RLock()
-	defer repo.mu.RUnlock()
 	tipOID := repo.resolveCommitLocked(shaParam)
 	if tipOID == "" {
 		return []map[string]any{}, nil
@@ -934,18 +935,16 @@ func (s *ForgeStore) CreateLabel(owner, name, labelName, color string) (LabelRec
 	if err != nil {
 		return LabelRecord{}, err
 	}
-	clean := strings.TrimSpace(labelName)
+	clean := strings.Clone(strings.TrimSpace(labelName))
 	if clean == "" {
 		return LabelRecord{}, &StoreError{Status: 422, Message: "Label name is required"}
 	}
-	c := strings.TrimSpace(color)
+	c := strings.Clone(strings.TrimSpace(color))
 	if c == "" {
 		c = "ededed"
 	}
 	lbl := LabelRecord{Name: clean, Color: c}
-	repo.mu.Lock()
 	repo.Labels[clean] = lbl
-	repo.mu.Unlock()
 	return lbl, nil
 }
 
@@ -954,12 +953,10 @@ func (s *ForgeStore) ListLabels(owner, name string) ([]LabelRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	repo.mu.RLock()
 	out := make([]LabelRecord, 0, len(repo.Labels))
 	for _, lbl := range repo.Labels {
 		out = append(out, lbl)
 	}
-	repo.mu.RUnlock()
 	return out, nil
 }
 
@@ -972,20 +969,22 @@ func (s *ForgeStore) CreateIssue(owner, name, title, body string, labelNames []s
 		return nil, &StoreError{Status: 422, Message: "Issue title is required"}
 	}
 
-	entityID := int(s.nextIssueID.Add(1))
+	s.nextIssueID++
+	entityID := int(s.nextIssueID)
 	_, createdAt, seq := s.nextClock()
 
-	repo.mu.Lock()
-	labels := make([]LabelRecord, 0, len(labelNames))
+	var labels []LabelRecord
 	if checkLabels {
+		labels = make([]LabelRecord, 0, len(labelNames))
 		for _, ln := range labelNames {
 			found, ok := repo.Labels[ln]
 			if !ok {
-				repo.mu.Unlock()
 				return nil, &StoreError{Status: 422, Message: fmt.Sprintf("Validation Failed: unknown label %q", ln)}
 			}
 			labels = append(labels, found)
 		}
+	} else {
+		labels = []LabelRecord{}
 	}
 	num := repo.NextNumber
 	repo.NextNumber++
@@ -994,17 +993,22 @@ func (s *ForgeStore) CreateIssue(owner, name, title, body string, labelNames []s
 		ID:        entityID,
 		NodeID:    gid,
 		Number:    num,
-		Title:     title,
-		Body:      body,
+		Title:     strings.Clone(title),
+		Body:      strings.Clone(body),
 		State:     "open",
 		Labels:    labels,
 		CreatedAt: createdAt,
 		Seq:       seq,
 	}
-	rebuildIssueFrames(issue)
+	jb := buildIssueJSON(issue)
+	issue.jsonBytes = jb
+	issue.http201Frame = buildHTTPFrameBytes(201, "Created", jb, "")
+
 	repo.Issues = append(repo.Issues, issue)
-	repo.IssuesByNumber[num] = issue
-	repo.mu.Unlock()
+	for len(repo.IssuesByNum) <= num {
+		repo.IssuesByNum = append(repo.IssuesByNum, nil)
+	}
+	repo.IssuesByNum[num] = issue
 
 	return issue, nil
 }
@@ -1014,9 +1018,7 @@ func (s *ForgeStore) GetIssue(owner, name string, number int) (*IssueRecord, err
 	if err != nil {
 		return nil, err
 	}
-	repo.mu.RLock()
-	issue := repo.IssuesByNumber[number]
-	repo.mu.RUnlock()
+	issue := repo.GetIssue(number)
 	if issue == nil {
 		return nil, &StoreError{Status: 404, Message: "Not Found"}
 	}
@@ -1032,14 +1034,12 @@ func (s *ForgeStore) ListIssues(owner, name, state, direction string) ([]*IssueR
 	if st == "" {
 		st = "open"
 	}
-	repo.mu.RLock()
 	filtered := make([]*IssueRecord, 0, len(repo.Issues))
 	for _, iss := range repo.Issues {
 		if st == "all" || iss.State == st {
 			filtered = append(filtered, iss)
 		}
 	}
-	repo.mu.RUnlock()
 	asc := direction == "asc"
 	sort.Slice(filtered, func(i, j int) bool {
 		if asc {
@@ -1055,22 +1055,23 @@ func (s *ForgeStore) UpdateIssue(owner, name string, number int, state, title, b
 	if err != nil {
 		return nil, err
 	}
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
-	issue := repo.IssuesByNumber[number]
+	issue := repo.GetIssue(number)
 	if issue == nil {
 		return nil, &StoreError{Status: 404, Message: "Not Found"}
 	}
 	if state != nil && (*state == "open" || *state == "closed") {
-		issue.State = *state
+		issue.State = strings.Clone(*state)
 	}
 	if title != nil {
-		issue.Title = *title
+		issue.Title = strings.Clone(*title)
 	}
 	if body != nil {
-		issue.Body = *body
+		issue.Body = strings.Clone(*body)
 	}
-	rebuildIssueFrames(issue)
+	jb := buildIssueJSON(issue)
+	issue.jsonBytes = jb
+	issue.http200Frame = buildHTTPFrameBytes(200, "OK", jb, "")
+	issue.http201Frame = nil
 	return issue, nil
 }
 
@@ -1083,21 +1084,20 @@ func (s *ForgeStore) AddComment(owner, name string, number int, body string) (*C
 		return nil, err
 	}
 
-	id := int(s.nextCommentID.Add(1))
+	s.nextCommentID++
+	id := int(s.nextCommentID)
 	_, createdAt, seq := s.nextClock()
 
 	gid := EncodeGlobalID("Comment", id)
 	rec := &CommentRecord{
 		ID:        id,
 		NodeID:    gid,
-		Body:      body,
+		Body:      strings.Clone(body),
 		CreatedAt: createdAt,
 		Seq:       seq,
 	}
 
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
-	if repo.IssuesByNumber[number] == nil && repo.PullsByNumber[number] == nil {
+	if repo.GetIssue(number) == nil && repo.PullsByNumber[number] == nil {
 		return nil, &StoreError{Status: 404, Message: "Not Found"}
 	}
 	repo.CommentsByNumber[number] = append(repo.CommentsByNumber[number], rec)
@@ -1109,9 +1109,7 @@ func (s *ForgeStore) ListComments(owner, name string, number int) ([]*CommentRec
 	if err != nil {
 		return nil, err
 	}
-	repo.mu.RLock()
-	defer repo.mu.RUnlock()
-	if repo.IssuesByNumber[number] == nil && repo.PullsByNumber[number] == nil {
+	if repo.GetIssue(number) == nil && repo.PullsByNumber[number] == nil {
 		return nil, &StoreError{Status: 404, Message: "Not Found"}
 	}
 	list := repo.CommentsByNumber[number]
@@ -1131,17 +1129,16 @@ func (s *ForgeStore) CreatePull(owner, name, title, body, head, base string) (*P
 	if title == "" || head == "" || base == "" {
 		return nil, &StoreError{Status: 422, Message: "title, head, and base are required"}
 	}
-	headRef := strings.TrimPrefix(head, "refs/heads/")
-	baseRef := strings.TrimPrefix(base, "refs/heads/")
+	headRef := strings.Clone(strings.TrimPrefix(head, "refs/heads/"))
+	baseRef := strings.Clone(strings.TrimPrefix(base, "refs/heads/"))
 
-	id := int(s.nextPullID.Add(1))
+	s.nextPullID++
+	id := int(s.nextPullID)
 	_, createdAt, _ := s.nextClock()
 
-	repo.mu.Lock()
 	headSHA := repo.Refs["refs/heads/"+headRef]
 	baseSHA := repo.Refs["refs/heads/"+baseRef]
 	if headSHA == "" || baseSHA == "" {
-		repo.mu.Unlock()
 		return nil, &StoreError{Status: 422, Message: "head or base branch does not exist"}
 	}
 	num := repo.NextNumber
@@ -1152,8 +1149,8 @@ func (s *ForgeStore) CreatePull(owner, name, title, body, head, base string) (*P
 		NodeID:    gid,
 		Number:    num,
 		State:     "open",
-		Title:     title,
-		Body:      body,
+		Title:     strings.Clone(title),
+		Body:      strings.Clone(body),
 		Head:      RefEnd{Ref: headRef, SHA: headSHA},
 		Base:      RefEnd{Ref: baseRef, SHA: baseSHA},
 		Merged:    false,
@@ -1165,7 +1162,6 @@ func (s *ForgeStore) CreatePull(owner, name, title, body, head, base string) (*P
 	}
 	repo.Pulls = append(repo.Pulls, pr)
 	repo.PullsByNumber[num] = pr
-	repo.mu.Unlock()
 
 	return pr, nil
 }
@@ -1184,14 +1180,12 @@ func (s *ForgeStore) ListPulls(owner, name, state string) ([]*PullRecord, error)
 	if st == "" {
 		st = "open"
 	}
-	repo.mu.RLock()
 	out := make([]*PullRecord, 0, len(repo.Pulls))
 	for _, pr := range repo.Pulls {
 		if st == "all" || pr.State == st {
 			out = append(out, clonePullSnapshot(pr))
 		}
 	}
-	repo.mu.RUnlock()
 	return out, nil
 }
 
@@ -1200,15 +1194,11 @@ func (s *ForgeStore) GetPull(owner, name string, number int) (*PullRecord, error
 	if err != nil {
 		return nil, err
 	}
-	repo.mu.RLock()
 	pr := repo.PullsByNumber[number]
 	if pr == nil {
-		repo.mu.RUnlock()
 		return nil, &StoreError{Status: 404, Message: "Not Found"}
 	}
-	cp := clonePullSnapshot(pr)
-	repo.mu.RUnlock()
-	return cp, nil
+	return clonePullSnapshot(pr), nil
 }
 
 func (s *ForgeStore) GetPullFiles(owner, name string, number int) ([]FileDiffItem, error) {
@@ -1216,8 +1206,6 @@ func (s *ForgeStore) GetPullFiles(owner, name string, number int) ([]FileDiffIte
 	if err != nil {
 		return nil, err
 	}
-	repo.mu.RLock()
-	defer repo.mu.RUnlock()
 	pr := repo.PullsByNumber[number]
 	if pr == nil {
 		return nil, &StoreError{Status: 404, Message: "Not Found"}
@@ -1230,7 +1218,7 @@ func (s *ForgeStore) GetPullFiles(owner, name string, number int) ([]FileDiffIte
 	if curBase == "" {
 		curBase = pr.baseSHA
 	}
-	ancOID := FindMergeBase(repo.CommitParents, curBase, curHead)
+	ancOID := FindMergeBase(repo.Objects, curBase, curHead)
 	if ancOID == "" {
 		ancOID = pr.baseSHA
 	}
@@ -1240,8 +1228,6 @@ func (s *ForgeStore) GetPullFiles(owner, name string, number int) ([]FileDiffIte
 }
 
 func (s *ForgeStore) IsPullMergeable(repo *RepoRecord, pr *PullRecord) bool {
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
 	_, _, _, ok := s.computePullMergeLocked(repo, pr)
 	return ok
 }
@@ -1255,7 +1241,7 @@ func (s *ForgeStore) computePullMergeLocked(repo *RepoRecord, pr *PullRecord) (s
 	if headTip == "" {
 		headTip = pr.headSHA
 	}
-	ancOID := FindMergeBase(repo.CommitParents, baseTip, headTip)
+	ancOID := FindMergeBase(repo.Objects, baseTip, headTip)
 	var ancMap map[string]PathBlobEntry
 	if ancOID != "" {
 		ancMap = FlattenTree(repo.Objects, ancOID)
@@ -1278,9 +1264,6 @@ func (s *ForgeStore) MergePull(owner, name string, number int, mergeMethod strin
 	}
 	epoch, iso, _ := s.nextClock()
 	who := s.authorLine(epoch)
-
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
 
 	pr := repo.PullsByNumber[number]
 	if pr == nil {

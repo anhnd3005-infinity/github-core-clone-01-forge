@@ -74,10 +74,7 @@ func executeMcpTool(store *ForgeStore, name string, args map[string]any) (int, s
 		if err != nil {
 			return 0, "", map[string]any{"content": []map[string]string{{"type": "text", "text": err.Error()}}, "isError": true}
 		}
-		repo.mu.RLock()
-		view := repo.JSONView()
-		repo.mu.RUnlock()
-		return 0, "", mcpToolSuccess(view)
+		return 0, "", mcpToolSuccess(repo.JSONView())
 
 	case "get_repo":
 		if miss := missing("owner", "repo"); miss != "" {
@@ -87,10 +84,7 @@ func executeMcpTool(store *ForgeStore, name string, args map[string]any) (int, s
 		if err != nil {
 			return 0, "", map[string]any{"content": []map[string]string{{"type": "text", "text": err.Error()}}, "isError": true}
 		}
-		repo.mu.RLock()
-		view := repo.JSONView()
-		repo.mu.RUnlock()
-		return 0, "", mcpToolSuccess(view)
+		return 0, "", mcpToolSuccess(repo.JSONView())
 
 	case "create_issue":
 		if miss := missing("owner", "repo", "title"); miss != "" {

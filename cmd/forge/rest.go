@@ -8,26 +8,183 @@ import (
 )
 
 var (
-	restMetaHTTP         = buildHTTPFrameBytes(200, "OK", []byte(`{"installed_version":"1.0.0"}`), "")
-	restUnauthHTTP       = buildHTTPFrameBytes(401, "Unauthorized", []byte(`{"message":"Requires authentication"}`), "")
-	restNotFoundHTTP     = buildHTTPFrameBytes(404, "Not Found", []byte(`{"message":"Not Found"}`), "")
-	restMalformedJSON    = buildHTTPFrameBytes(400, "Bad Request", []byte(`{"message":"Problems parsing JSON"}`), "")
-	restNoContentHTTP    = []byte("HTTP/1.1 204 No Content\r\nContent-Type: application/json; charset=utf-8\r\nX-GitHub-Request-Id: fg-ok\r\n\r\n")
+	bearerPrefix      = []byte("Bearer ")
+	restMetaHTTP      = buildHTTPFrameBytes(200, "OK", []byte(`{"installed_version":"1.0.0"}`), "")
+	restUnauthHTTP    = buildHTTPFrameBytes(401, "Unauthorized", []byte(`{"message":"Requires authentication"}`), "")
+	restNotFoundHTTP  = buildHTTPFrameBytes(404, "Not Found", []byte(`{"message":"Not Found"}`), "")
+	restMalformedJSON = buildHTTPFrameBytes(400, "Bad Request", []byte(`{"message":"Problems parsing JSON"}`), "")
+	restNoContentHTTP = []byte("HTTP/1.1 204 No Content\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\n\r\n")
 )
 
-func IsAuthorized(authHeader []byte, expectedBearer []byte) bool {
-	const prefix = "Bearer "
-	if len(authHeader) <= len(prefix) || !bytes.HasPrefix(authHeader, []byte(prefix)) {
+func buildExpectedAuth(rawToken string) []byte {
+	tok := strings.TrimSpace(rawToken)
+	if tok == "" {
+		return nil
+	}
+	out := make([]byte, len(bearerPrefix)+len(tok))
+	copy(out, bearerPrefix)
+	copy(out[len(bearerPrefix):], tok)
+	return out
+}
+
+func IsAuthorized(authHeader []byte, expectedAuth []byte) bool {
+	if len(expectedAuth) > 0 {
+		if bytes.Equal(authHeader, expectedAuth) {
+			return true
+		}
+		if len(authHeader) > len(expectedAuth) && bytes.HasPrefix(authHeader, bearerPrefix) {
+			return bytes.Equal(bytes.TrimSpace(authHeader[len(bearerPrefix):]), expectedAuth[len(bearerPrefix):])
+		}
 		return false
 	}
-	token := bytes.TrimSpace(authHeader[len(prefix):])
-	if len(token) == 0 {
-		return false
+	return len(authHeader) > len(bearerPrefix) && bytes.HasPrefix(authHeader, bearerPrefix) && len(bytes.TrimSpace(authHeader[len(bearerPrefix):])) > 0
+}
+
+func parseASCIIPositiveInt(s string) (int, bool) {
+	if s == "" {
+		return 0, false
 	}
-	if len(expectedBearer) > 0 {
-		return bytes.Equal(token, expectedBearer)
+	v := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		v = v*10 + int(c-'0')
 	}
-	return true
+	if v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+func skipJSONSpace(b []byte, i int) int {
+	for i < len(b) {
+		c := b[i]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			i++
+			continue
+		}
+		break
+	}
+	return i
+}
+
+func scanJSONStringFast(b []byte, idx *int) (string, bool) {
+	i := *idx
+	if i >= len(b) || b[i] != '"' {
+		return "", false
+	}
+	i++
+	start := i
+	hasEsc := false
+	for i < len(b) {
+		c := b[i]
+		if c == '"' {
+			end := i
+			i++
+			*idx = i
+			if !hasEsc {
+				return string(b[start:end]), true
+			}
+			var decBuf [256]byte
+			out := decBuf[:0]
+			for j := start; j < end; j++ {
+				ch := b[j]
+				if ch != '\\' {
+					out = append(out, ch)
+					continue
+				}
+				j++
+				if j >= end {
+					return "", false
+				}
+				switch b[j] {
+				case '"', '\\', '/':
+					out = append(out, b[j])
+				case 'b':
+					out = append(out, '\b')
+				case 'f':
+					out = append(out, '\f')
+				case 'n':
+					out = append(out, '\n')
+				case 'r':
+					out = append(out, '\r')
+				case 't':
+					out = append(out, '\t')
+				default:
+					return "", false
+				}
+			}
+			return string(out), true
+		}
+		if c == '\\' {
+			hasEsc = true
+			i += 2
+			continue
+		}
+		if c < 0x20 {
+			return "", false
+		}
+		i++
+	}
+	return "", false
+}
+
+func parseCreateIssueFast(body []byte) (string, string, bool) {
+	i := skipJSONSpace(body, 0)
+	if i >= len(body) {
+		return "", "", true
+	}
+	if body[i] != '{' {
+		return "", "", false
+	}
+	i = skipJSONSpace(body, i+1)
+	if i < len(body) && body[i] == '}' {
+		i = skipJSONSpace(body, i+1)
+		return "", "", i == len(body)
+	}
+	var title, bodyText string
+	first := true
+	for {
+		if !first {
+			if i >= len(body) || body[i] != ',' {
+				break
+			}
+			i = skipJSONSpace(body, i+1)
+		}
+		first = false
+		k, ok := scanJSONStringFast(body, &i)
+		if !ok {
+			return "", "", false
+		}
+		i = skipJSONSpace(body, i)
+		if i >= len(body) || body[i] != ':' {
+			return "", "", false
+		}
+		i = skipJSONSpace(body, i+1)
+		val, vOK := scanJSONStringFast(body, &i)
+		if !vOK {
+			return "", "", false
+		}
+		switch k {
+		case "title":
+			title = val
+		case "body":
+			bodyText = val
+		default:
+			return "", "", false
+		}
+		i = skipJSONSpace(body, i)
+		if i < len(body) && body[i] == '}' {
+			i = skipJSONSpace(body, i+1)
+			return title, bodyText, i == len(body)
+		}
+		if i >= len(body) || body[i] != ',' {
+			return "", "", false
+		}
+	}
+	return "", "", false
 }
 
 func decodePercent(s string) string {
@@ -172,75 +329,6 @@ func HandleRestAPI(req *RawRequest, store *ForgeStore, expectedToken []byte) ([]
 		rel = req.Path[len("/api/v3"):]
 	}
 
-	if req.Method == "GET" && rel == "/meta" {
-		return restMetaHTTP, true
-	}
-
-	if req.Method == "GET" && rel == "/" {
-		host := req.Host
-		if host == "" {
-			host = "127.0.0.1"
-		}
-		payload := map[string]string{
-			"current_user_url": "http://" + host + "/api/v3/user",
-			"rate_limit_url":   "http://" + host + "/api/v3/rate_limit",
-		}
-		return jsonFrame(200, "OK", payload, "X-OAuth-Scopes: repo, read:org\r\n"), true
-	}
-
-	if req.Method == "GET" && rel == "/user" {
-		return jsonFrame(200, "OK", store.Viewer, ""), true
-	}
-
-	if rel == "/user/repos" {
-		if req.Method == "POST" {
-			obj, ok := parseJSONObject(req.Body)
-			if !ok {
-				return restMalformedJSON, true
-			}
-			name, _ := rawString(obj, "name")
-			desc, _ := rawString(obj, "description")
-			priv, _ := rawBool(obj, "private")
-			repo, err := store.CreateRepo(name, desc, priv)
-			if err != nil {
-				return storeErrorFrame(err), true
-			}
-			return jsonFrame(201, "Created", repo.JSONView(), ""), true
-		}
-		if req.Method == "GET" {
-			perPage := 30
-			if v, err := strconv.Atoi(queryParam(req.Query, "per_page")); err == nil && v > 0 {
-				if v > 100 {
-					v = 100
-				}
-				perPage = v
-			}
-			page := 1
-			if v, err := strconv.Atoi(queryParam(req.Query, "page")); err == nil && v > 0 {
-				page = v
-			}
-			all := store.ListViewerRepos()
-			start := (page - 1) * perPage
-			if start > len(all) {
-				start = len(all)
-			}
-			end := start + perPage
-			if end > len(all) {
-				end = len(all)
-			}
-			slice := all[start:end]
-			extra := ""
-			if end < len(all) {
-				host := req.Host
-				if host == "" {
-					host = "127.0.0.1"
-				}
-				extra = "Link: <http://" + host + "/api/v3/user/repos?per_page=" + strconv.Itoa(perPage) + "&page=" + strconv.Itoa(page+1) + ">; rel=\"next\"\r\n"
-			}
-			return jsonFrame(200, "OK", slice, extra), true
-		}
-	}
-
 	if strings.HasPrefix(rel, "/repos/") {
 		rest := rel[len("/repos/"):]
 		s1 := strings.IndexByte(rest, '/')
@@ -261,10 +349,7 @@ func HandleRestAPI(req *RawRequest, store *ForgeStore, expectedToken []byte) ([]
 				if err != nil {
 					return storeErrorFrame(err), true
 				}
-				repo.mu.RLock()
-				view := repo.JSONView()
-				repo.mu.RUnlock()
-				return jsonFrame(200, "OK", view, ""), true
+				return jsonFrame(200, "OK", repo.JSONView(), ""), true
 			case "PATCH":
 				obj, ok := parseJSONObject(req.Body)
 				if !ok {
@@ -302,8 +387,8 @@ func HandleRestAPI(req *RawRequest, store *ForgeStore, expectedToken []byte) ([]
 		if strings.HasPrefix(sub, "issues/") {
 			numPart := sub[len("issues/"):]
 			if slash := strings.IndexByte(numPart, '/'); slash < 0 {
-				num, err := strconv.Atoi(numPart)
-				if err != nil || num <= 0 {
+				num, okNum := parseASCIIPositiveInt(numPart)
+				if !okNum {
 					return restNotFoundHTTP, true
 				}
 				if req.Method == "GET" {
@@ -311,17 +396,11 @@ func HandleRestAPI(req *RawRequest, store *ForgeStore, expectedToken []byte) ([]
 					if repo == nil {
 						return restNotFoundHTTP, true
 					}
-					repo.mu.RLock()
-					iss := repo.IssuesByNumber[num]
-					var frame []byte
-					if iss != nil {
-						frame = iss.http200Frame
-					}
-					repo.mu.RUnlock()
-					if frame == nil {
+					iss := repo.GetIssue(num)
+					if iss == nil {
 						return restNotFoundHTTP, true
 					}
-					return frame, true
+					return iss.HTTP200Frame(), true
 				}
 				if req.Method == "PATCH" {
 					obj, ok := parseJSONObject(req.Body)
@@ -342,14 +421,14 @@ func HandleRestAPI(req *RawRequest, store *ForgeStore, expectedToken []byte) ([]
 					if uErr != nil {
 						return storeErrorFrame(uErr), true
 					}
-					return iss.http200Frame, true
+					return iss.HTTP200Frame(), true
 				}
 				return restNotFoundHTTP, true
 			} else {
 				numStr := numPart[:slash]
 				tail := numPart[slash+1:]
-				num, err := strconv.Atoi(numStr)
-				if err != nil || num <= 0 {
+				num, okNum := parseASCIIPositiveInt(numStr)
+				if !okNum {
 					return restNotFoundHTTP, true
 				}
 				if tail == "comments" {
@@ -379,6 +458,13 @@ func HandleRestAPI(req *RawRequest, store *ForgeStore, expectedToken []byte) ([]
 
 		if sub == "issues" {
 			if req.Method == "POST" {
+				if title, bodyText, okFast := parseCreateIssueFast(req.Body); okFast {
+					iss, cErr := store.CreateIssue(owner, repoName, title, bodyText, nil, false)
+					if cErr != nil {
+						return storeErrorFrame(cErr), true
+					}
+					return iss.http201Frame, true
+				}
 				var issueReq struct {
 					Title  string          `json:"title"`
 					Body   string          `json:"body"`
@@ -663,6 +749,77 @@ func HandleRestAPI(req *RawRequest, store *ForgeStore, expectedToken []byte) ([]
 					return jsonFrame(200, "OK", out, ""), true
 				}
 			}
+		}
+
+		return restNotFoundHTTP, true
+	}
+
+	if req.Method == "GET" && rel == "/meta" {
+		return restMetaHTTP, true
+	}
+
+	if req.Method == "GET" && rel == "/" {
+		host := req.Host
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		payload := map[string]string{
+			"current_user_url": "http://" + host + "/api/v3/user",
+			"rate_limit_url":   "http://" + host + "/api/v3/rate_limit",
+		}
+		return jsonFrame(200, "OK", payload, "X-OAuth-Scopes: repo, read:org\r\n"), true
+	}
+
+	if req.Method == "GET" && rel == "/user" {
+		return jsonFrame(200, "OK", store.Viewer, ""), true
+	}
+
+	if rel == "/user/repos" {
+		if req.Method == "POST" {
+			obj, ok := parseJSONObject(req.Body)
+			if !ok {
+				return restMalformedJSON, true
+			}
+			name, _ := rawString(obj, "name")
+			desc, _ := rawString(obj, "description")
+			priv, _ := rawBool(obj, "private")
+			repo, err := store.CreateRepo(name, desc, priv)
+			if err != nil {
+				return storeErrorFrame(err), true
+			}
+			return jsonFrame(201, "Created", repo.JSONView(), ""), true
+		}
+		if req.Method == "GET" {
+			perPage := 30
+			if v, err := strconv.Atoi(queryParam(req.Query, "per_page")); err == nil && v > 0 {
+				if v > 100 {
+					v = 100
+				}
+				perPage = v
+			}
+			page := 1
+			if v, err := strconv.Atoi(queryParam(req.Query, "page")); err == nil && v > 0 {
+				page = v
+			}
+			all := store.ListViewerRepos()
+			start := (page - 1) * perPage
+			if start > len(all) {
+				start = len(all)
+			}
+			end := start + perPage
+			if end > len(all) {
+				end = len(all)
+			}
+			slice := all[start:end]
+			extra := ""
+			if end < len(all) {
+				host := req.Host
+				if host == "" {
+					host = "127.0.0.1"
+				}
+				extra = "Link: <http://" + host + "/api/v3/user/repos?per_page=" + strconv.Itoa(perPage) + "&page=" + strconv.Itoa(page+1) + ">; rel=\"next\"\r\n"
+			}
+			return jsonFrame(200, "OK", slice, extra), true
 		}
 	}
 

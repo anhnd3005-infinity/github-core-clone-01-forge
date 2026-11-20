@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"sort"
 	"strconv"
@@ -35,10 +34,12 @@ var (
 )
 
 type GitObject struct {
-	OID      string
-	Type     string
-	Data     []byte
-	Deflated []byte
+	OID          string
+	Type         string
+	Data         []byte
+	Deflated     []byte
+	Parent1      string
+	ExtraParents []string
 }
 
 type TreeEntry struct {
@@ -94,31 +95,26 @@ func IsValidOID(s string) bool {
 	return true
 }
 
-var sha1Pool = sync.Pool{
-	New: func() any {
-		return sha1.New()
-	},
-}
+var reactorSHA1 = sha1.New()
 
 func HashGitObject(objType string, data []byte) string {
-	h := sha1Pool.Get().(hash.Hash)
-	h.Reset()
+	reactorSHA1.Reset()
 	var hdrBuf [40]byte
 	hdr := hdrBuf[:0]
 	hdr = append(hdr, objType...)
 	hdr = append(hdr, ' ')
 	hdr = strconv.AppendInt(hdr, int64(len(data)), 10)
 	hdr = append(hdr, 0)
-	h.Write(hdr)
-	h.Write(data)
+	reactorSHA1.Write(hdr)
+	reactorSHA1.Write(data)
 	var sum [20]byte
-	h.Sum(sum[:0])
-	sha1Pool.Put(h)
+	reactorSHA1.Sum(sum[:0])
 	return hex.EncodeToString(sum[:])
 }
 
-func ExtractCommitParents(data []byte) []string {
-	var parents []string
+func ExtractCommitParentsFast(data []byte) (string, []string) {
+	var p1 string
+	var extra []string
 	off := 0
 	for off < len(data) {
 		nl := bytes.IndexByte(data[off:], '\n')
@@ -134,19 +130,28 @@ func ExtractCommitParents(data []byte) []string {
 			break
 		}
 		if len(line) == 47 && bytes.HasPrefix(line, []byte("parent ")) {
-			parents = append(parents, string(line[7:]))
+			p := string(line[7:])
+			if p1 == "" {
+				p1 = p
+			} else {
+				extra = append(extra, p)
+			}
 		}
 	}
-	return parents
+	return p1, extra
 }
 
 func CreateGitObject(objType string, data []byte, deflated []byte) *GitObject {
-	return &GitObject{
+	obj := &GitObject{
 		OID:      HashGitObject(objType, data),
 		Type:     objType,
 		Data:     data,
 		Deflated: deflated,
 	}
+	if objType == "commit" {
+		obj.Parent1, obj.ExtraParents = ExtractCommitParentsFast(data)
+	}
+	return obj
 }
 
 func ParseTree(data []byte) []TreeEntry {
@@ -399,22 +404,47 @@ func BuildTreeFromPaths(saveObj func(*GitObject) *GitObject, pathMap map[string]
 	return writeNode(root)
 }
 
-func IsAncestor(commitParents map[string][]string, ancestorOID, descendantOID string) bool {
+func IsAncestor(objects map[string]*GitObject, ancestorOID, descendantOID string) bool {
 	if ancestorOID == descendantOID {
 		return true
 	}
-	direct := commitParents[descendantOID]
-	for _, p := range direct {
-		if p == ancestorOID {
+	dObj := objects[descendantOID]
+	if dObj == nil || dObj.Parent1 == "" {
+		return false
+	}
+	if dObj.Parent1 == ancestorOID {
+		return true
+	}
+	for _, ep := range dObj.ExtraParents {
+		if ep == ancestorOID {
 			return true
 		}
 	}
 	visited := map[string]struct{}{descendantOID: {}}
-	queue := []string{descendantOID}
+	queue := make([]string, 0, 16)
+	queue = append(queue, dObj.Parent1)
+	visited[dObj.Parent1] = struct{}{}
+	for _, ep := range dObj.ExtraParents {
+		if _, ok := visited[ep]; !ok {
+			visited[ep] = struct{}{}
+			queue = append(queue, ep)
+		}
+	}
 	for len(queue) > 0 {
 		cur := queue[len(queue)-1]
 		queue = queue[:len(queue)-1]
-		for _, p := range commitParents[cur] {
+		curObj := objects[cur]
+		if curObj == nil || curObj.Parent1 == "" {
+			continue
+		}
+		if curObj.Parent1 == ancestorOID {
+			return true
+		}
+		if _, ok := visited[curObj.Parent1]; !ok {
+			visited[curObj.Parent1] = struct{}{}
+			queue = append(queue, curObj.Parent1)
+		}
+		for _, p := range curObj.ExtraParents {
 			if p == ancestorOID {
 				return true
 			}
@@ -427,15 +457,22 @@ func IsAncestor(commitParents map[string][]string, ancestorOID, descendantOID st
 	return false
 }
 
-func FindMergeBase(commitParents map[string][]string, oidA, oidB string) string {
+func FindMergeBase(objects map[string]*GitObject, oidA, oidB string) string {
 	if oidA == oidB {
 		return oidA
 	}
 	ancA := map[string]struct{}{oidA: {}}
 	qA := []string{oidA}
 	for i := 0; i < len(qA); i++ {
-		cur := qA[i]
-		for _, p := range commitParents[cur] {
+		curObj := objects[qA[i]]
+		if curObj == nil || curObj.Parent1 == "" {
+			continue
+		}
+		if _, ok := ancA[curObj.Parent1]; !ok {
+			ancA[curObj.Parent1] = struct{}{}
+			qA = append(qA, curObj.Parent1)
+		}
+		for _, p := range curObj.ExtraParents {
 			if _, ok := ancA[p]; !ok {
 				ancA[p] = struct{}{}
 				qA = append(qA, p)
@@ -452,7 +489,15 @@ func FindMergeBase(commitParents map[string][]string, oidA, oidB string) string 
 		if _, ok := ancA[cur]; ok {
 			return cur
 		}
-		for _, p := range commitParents[cur] {
+		curObj := objects[cur]
+		if curObj == nil || curObj.Parent1 == "" {
+			continue
+		}
+		if _, ok := visitedB[curObj.Parent1]; !ok {
+			visitedB[curObj.Parent1] = struct{}{}
+			qB = append(qB, curObj.Parent1)
+		}
+		for _, p := range curObj.ExtraParents {
 			if _, ok := visitedB[p]; !ok {
 				visitedB[p] = struct{}{}
 				qB = append(qB, p)
@@ -717,7 +762,7 @@ func (r *sliceByteReader) ReadByte() (byte, error) {
 
 var zlibReaderPool sync.Pool
 
-func inflateExact(src []byte, expectedSize int) ([]byte, int, error) {
+func inflateExactStdlib(src []byte, expectedSize int) ([]byte, int, error) {
 	sr := sliceByteReader{data: src, pos: 0}
 	var zr io.ReadCloser
 	var err error
@@ -943,6 +988,9 @@ func UnpackPackfile(packBuf []byte, lookup func(string) *GitObject) ([]*GitObjec
 		return nil, ErrPackFormat
 	}
 
+	packCopy := make([]byte, len(packBuf))
+	copy(packCopy, packBuf)
+
 	type parsedEntry struct {
 		offset     int
 		typeCode   int
@@ -953,20 +1001,54 @@ func UnpackPackfile(packBuf []byte, lookup func(string) *GitObject) ([]*GitObjec
 		resolved   *GitObject
 	}
 
-	entries := make([]*parsedEntry, 0, count)
-	byOffset := make(map[int]*parsedEntry, count)
-	off := 12
+	directOut := make([]*GitObject, 0, count)
+	var offStack [16]int
+	offs := offStack[:0]
+	var entries []*parsedEntry
+	var byOffset map[int]*parsedEntry
+	var byOID map[string]*GitObject
 
+	off := 12
 	for i := 0; i < count; i++ {
 		entryOff := off
-		tc, sz, nextOff, err := readPackEntryHeader(packBuf, off)
+		tc, sz, nextOff, err := readPackEntryHeader(packCopy, off)
 		if err != nil {
 			return nil, err
 		}
 		off = nextOff
+
+		if (tc == 6 || tc == 7) && entries == nil {
+			entries = make([]*parsedEntry, len(directOut), count)
+			byOffset = make(map[int]*parsedEntry, count)
+			byOID = make(map[string]*GitObject, count)
+			for j, obj := range directOut {
+				pe := &parsedEntry{offset: offs[j], resolved: obj}
+				entries[j] = pe
+				byOffset[pe.offset] = pe
+				byOID[obj.OID] = obj
+			}
+		}
+
+		if entries == nil {
+			tName := codeToTypeName(tc)
+			if tName == "" {
+				return nil, ErrPackFormat
+			}
+			zStart := off
+			inflated, consumed, err := fastInflateZlib(packCopy[off:trailerStart], sz)
+			if err != nil {
+				return nil, err
+			}
+			off += consumed
+			obj := CreateGitObject(tName, inflated, packCopy[zStart:zStart+consumed])
+			directOut = append(directOut, obj)
+			offs = append(offs, entryOff)
+			continue
+		}
+
 		entry := &parsedEntry{offset: entryOff, typeCode: tc}
 		if tc == 6 {
-			dist, n2, err := readOfsDistance(packBuf, off)
+			dist, n2, err := readOfsDistance(packCopy, off)
 			if err != nil {
 				return nil, err
 			}
@@ -980,22 +1062,20 @@ func UnpackPackfile(packBuf []byte, lookup func(string) *GitObject) ([]*GitObjec
 			if off+20 > trailerStart {
 				return nil, ErrPackFormat
 			}
-			entry.baseOID = hex.EncodeToString(packBuf[off : off+20])
+			entry.baseOID = hex.EncodeToString(packCopy[off : off+20])
 			off += 20
 		} else if codeToTypeName(tc) == "" {
 			return nil, ErrPackFormat
 		}
 
 		zStart := off
-		inflated, consumed, err := inflateExact(packBuf[off:trailerStart], sz)
+		inflated, consumed, err := fastInflateZlib(packCopy[off:trailerStart], sz)
 		if err != nil {
 			return nil, err
 		}
 		entry.data = inflated
 		if tc != 6 && tc != 7 {
-			defCopy := make([]byte, consumed)
-			copy(defCopy, packBuf[zStart:zStart+consumed])
-			entry.deflated = defCopy
+			entry.deflated = packCopy[zStart : zStart+consumed]
 		}
 		off += consumed
 		entries = append(entries, entry)
@@ -1006,7 +1086,10 @@ func UnpackPackfile(packBuf []byte, lookup func(string) *GitObject) ([]*GitObjec
 		return nil, ErrPackFormat
 	}
 
-	byOID := make(map[string]*GitObject, len(entries))
+	if entries == nil {
+		return directOut, nil
+	}
+
 	resolving := make(map[int]bool)
 
 	var resolve func(e *parsedEntry) (*GitObject, error)

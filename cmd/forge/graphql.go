@@ -861,18 +861,14 @@ func projectGqlRepo(repo *RepoRecord, selSet []gqlSel, ctx *gqlExecCtx) map[stri
 			})
 		case "issue":
 			num, _ := asIntArg(args["number"])
-			repo.mu.RLock()
-			found := repo.IssuesByNumber[num]
-			repo.mu.RUnlock()
+			found := repo.GetIssue(num)
 			if found == nil {
 				return nil
 			}
 			return projectGqlIssue(found, fieldSel.subSet, ctx)
 		case "issues":
-			repo.mu.RLock()
 			items := make([]*IssueRecord, len(repo.Issues))
 			copy(items, repo.Issues)
-			repo.mu.RUnlock()
 
 			if rawStates, ok := args["states"].([]any); ok && len(rawStates) > 0 {
 				wanted := make(map[string]bool, len(rawStates))
@@ -950,20 +946,13 @@ func projectGqlRepo(repo *RepoRecord, selSet []gqlSel, ctx *gqlExecCtx) map[stri
 			})
 		case "pullRequest":
 			num, _ := asIntArg(args["number"])
-			repo.mu.RLock()
 			found := repo.PullsByNumber[num]
-			var snap *PullRecord
-			if found != nil {
-				cp := *found
-				snap = &cp
-			}
-			repo.mu.RUnlock()
-			if snap == nil {
+			if found == nil {
 				return nil
 			}
-			return projectGqlPull(repo, snap, fieldSel.subSet, ctx)
+			cp := *found
+			return projectGqlPull(repo, &cp, fieldSel.subSet, ctx)
 		case "pullRequests":
-			repo.mu.RLock()
 			total := len(repo.Pulls)
 			first := total
 			if f, ok := asIntArg(args["first"]); ok && f >= 0 && f < first {
@@ -974,7 +963,6 @@ func projectGqlRepo(repo *RepoRecord, selSet []gqlSel, ctx *gqlExecCtx) map[stri
 				cp := *repo.Pulls[i]
 				snaps[i] = &cp
 			}
-			repo.mu.RUnlock()
 			return selectGqlObject("PullRequestConnection", fieldSel.subSet, ctx, func(cf string, _ map[string]any, cSel gqlSel) any {
 				if cf == "nodes" {
 					nodes := make([]map[string]any, len(snaps))
